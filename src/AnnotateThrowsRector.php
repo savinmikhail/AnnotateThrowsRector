@@ -515,9 +515,17 @@ PHP,
             return $this->externalThrowsCache[$cacheKey] = [];
         }
 
-        return $this->externalThrowsCache[$cacheKey] = $this->normalizeTypes(
-            $this->resolveTypeClassNames($methodReflection->getThrowType()),
-        );
+        $throws = $this->resolveTypeClassNames($methodReflection->getThrowType());
+
+        $docComment = $methodReflection->getDocComment();
+        if (is_string($docComment) && $docComment !== '') {
+            preg_match_all('~@throws\s+([^\r\n*]+)~', $docComment, $matches);
+            foreach ($matches[1] as $throwSignature) {
+                $throws = [...$throws, ...$this->extractTypeNamesFromString($throwSignature)];
+            }
+        }
+
+        return $this->externalThrowsCache[$cacheKey] = $this->normalizeTypes($throws);
     }
 
     private function resolveCurrentClassName(ClassLike $classLike): ?string
