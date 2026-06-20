@@ -22,6 +22,7 @@ use Rector\BetterPhpDocParser\ValueObject\Type\FullyQualifiedIdentifierTypeNode;
 use Rector\Comments\NodeDocBlock\DocBlockUpdater;
 use Rector\NodeTypeResolver\Node\AttributeKey;
 use Rector\Rector\AbstractRector;
+use Rector\Reflection\MethodReflectionResolver;
 use SavinMikhail\AnnotateThrowsRector\ValueObject\MethodAnalysis;
 use SavinMikhail\AnnotateThrowsRector\ValueObject\MethodCallEdge;
 use Symplify\RuleDocGenerator\ValueObject\CodeSample\CodeSample;
@@ -38,7 +39,6 @@ use function is_a;
 use function is_array;
 use function is_string;
 use function ltrim;
-use function preg_match;
 use function preg_match_all;
 use function sort;
 use function strcasecmp;
@@ -78,6 +78,7 @@ final class AnnotateThrowsRector extends AbstractRector
         private readonly PhpDocInfoFactory $phpDocInfoFactory,
         private readonly DocBlockUpdater $docBlockUpdater,
         private readonly ReflectionProvider $reflectionProvider,
+        private readonly MethodReflectionResolver $methodReflectionResolver,
     ) {
     }
 
@@ -444,24 +445,19 @@ PHP,
             return $this->externalThrowsCache[$cacheKey] = [];
         }
 
-        $nativeReflection = $this->reflectionProvider->getClass($className)->getNativeReflection();
-        if (!$nativeReflection->hasMethod($methodName)) {
+        $methodReflection = $this->methodReflectionResolver->resolveMethodReflection(
+            className: $className,
+            methodName: $methodName,
+            scope: null,
+        );
+
+        if ($methodReflection === null) {
             return $this->externalThrowsCache[$cacheKey] = [];
         }
 
-        $docComment = $nativeReflection->getMethod($methodName)->getDocComment();
-        if ($docComment === false) {
-            return $this->externalThrowsCache[$cacheKey] = [];
-        }
-
-        preg_match_all('~@throws\s+([^\r\n*]+)~', $docComment, $matches);
-
-        $throws = [];
-        foreach ($matches[1] as $throwSignature) {
-            $throws = [...$throws, ...$this->extractTypeNamesFromString($throwSignature)];
-        }
-
-        return $this->externalThrowsCache[$cacheKey] = $this->normalizeTypes($throws);
+        return $this->externalThrowsCache[$cacheKey] = $this->normalizeTypes(
+            $this->resolveTypeClassNames($methodReflection->getThrowType()),
+        );
     }
 
     private function resolveCurrentClassName(ClassLike $classLike): ?string
