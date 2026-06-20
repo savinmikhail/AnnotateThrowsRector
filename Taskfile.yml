@@ -79,3 +79,27 @@ tasks:
 #      - task: composer-check-require
 #      - task: composer-check-unused
       - task: dist-size-optimize
+
+  tag:
+    cmd: |
+      set -eu
+      if [ -n "$(git status --porcelain)" ]; then
+        echo "Working tree is dirty. Commit or stash changes before tagging." >&2
+        exit 1
+      fi
+      LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+      if [ -z "$LATEST_TAG" ]; then
+        LATEST_TAG="v0.0.0"
+      fi
+      VERSION=${LATEST_TAG#v}
+      MAJOR=$(printf '%s' "$VERSION" | cut -d. -f1)
+      MINOR=$(printf '%s' "$VERSION" | cut -d. -f2)
+      PATCH=$(printf '%s' "$VERSION" | cut -d. -f3)
+      NEXT_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+      if git rev-parse -q --verify "refs/tags/$NEXT_TAG" >/dev/null; then
+        echo "Tag $NEXT_TAG already exists." >&2
+        exit 1
+      fi
+      git tag "$NEXT_TAG"
+      git push origin "$NEXT_TAG"
+      echo "Pushed $NEXT_TAG"
