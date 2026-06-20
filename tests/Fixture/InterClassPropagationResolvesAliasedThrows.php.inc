@@ -40,9 +40,6 @@ final class InterClassPropagationResolvesAliasedThrows
     {
     }
 
-    /**
-     * @throws \RuntimeException
-     */
     public function run(): void
     {
         $this->externalService->process();

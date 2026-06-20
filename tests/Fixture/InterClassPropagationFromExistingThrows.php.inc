@@ -32,9 +32,6 @@ final class InterClassPropagationFromExistingThrows
     {
     }
 
-    /**
-     * @throws \RuntimeException
-     */
     public function run(): void
     {
         $this->externalService->process();

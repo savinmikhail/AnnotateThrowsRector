@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace SavinMikhail\AnnotateThrowsRector;
 
+use PHPStan\Analyser\Scope;
+use PHPStan\DependencyInjection\ContainerFactory;
 use PHPStan\PhpDocParser\Ast\PhpDoc\PhpDocTagNode;
 use PHPStan\PhpDocParser\Ast\PhpDoc\ThrowsTagValueNode;
+use PHPStan\Rules\Exceptions\DefaultExceptionTypeResolver;
 use PHPStan\Type\Type;
 use PhpParser\Node;
 use PhpParser\Node\Expr\MethodCall;
@@ -20,6 +23,9 @@ use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfo;
 use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfoFactory;
 use Rector\BetterPhpDocParser\ValueObject\Type\FullyQualifiedIdentifierTypeNode;
 use Rector\Comments\NodeDocBlock\DocBlockUpdater;
+use Rector\Configuration\Option;
+use Rector\Configuration\Parameter\SimpleParameterProvider;
+use Rector\Contract\Rector\ConfigurableRectorInterface;
 use Rector\NodeTypeResolver\Node\AttributeKey;
 use Rector\Rector\AbstractRector;
 use Rector\Reflection\MethodReflectionResolver;
@@ -33,19 +39,26 @@ use function array_diff;
 use function array_key_exists;
 use function array_map;
 use function array_unique;
+use function getcwd;
 use function class_exists;
 use function interface_exists;
 use function is_a;
 use function is_array;
+use function is_dir;
 use function is_string;
 use function ltrim;
+use function mkdir;
 use function preg_match_all;
 use function sort;
 use function strcasecmp;
 use function sprintf;
+use function sys_get_temp_dir;
 
-final class AnnotateThrowsRector extends AbstractRector
+final class AnnotateThrowsRector extends AbstractRector implements ConfigurableRectorInterface
 {
+    public const INCLUDE_UNCHECKED = 'include_unchecked';
+    public const EXCLUDED_EXCEPTION_CLASSES = 'excluded_exception_classes';
+
     /**
      * @var string[]
      */
@@ -74,12 +87,41 @@ final class AnnotateThrowsRector extends AbstractRector
      */
     private array $externalThrowsCache = [];
 
+    private ?DefaultExceptionTypeResolver $exceptionTypeResolver = null;
+
+    private bool $includeUnchecked = false;
+
+    /**
+     * @var string[]
+     */
+    private array $excludedExceptionClasses = [
+        \Throwable::class,
+        \Exception::class,
+        \Error::class,
+        \RuntimeException::class,
+        \LogicException::class,
+    ];
+
     public function __construct(
         private readonly PhpDocInfoFactory $phpDocInfoFactory,
         private readonly DocBlockUpdater $docBlockUpdater,
         private readonly ReflectionProvider $reflectionProvider,
         private readonly MethodReflectionResolver $methodReflectionResolver,
     ) {
+    }
+
+    public function configure(array $configuration): void
+    {
+        $this->includeUnchecked = (bool) ($configuration[self::INCLUDE_UNCHECKED] ?? false);
+
+        if (array_key_exists(self::EXCLUDED_EXCEPTION_CLASSES, $configuration)) {
+            $this->excludedExceptionClasses = $this->normalizeTypes($configuration[self::EXCLUDED_EXCEPTION_CLASSES]);
+            return;
+        }
+
+        if ($this->includeUnchecked) {
+            $this->excludedExceptionClasses = [];
+        }
     }
 
     public function getRuleDefinition(): RuleDefinition
@@ -144,6 +186,10 @@ PHP,
         }
 
         $currentClassName = $this->resolveCurrentClassName($node);
+        $scope = $node->getAttribute(AttributeKey::SCOPE);
+        if (!$scope instanceof Scope) {
+            $scope = null;
+        }
         $analyses = [];
         foreach ($methods as $methodName => $method) {
             $analyses[$methodName] = $this->analyzeMethod($method, $currentClassName);
@@ -192,7 +238,12 @@ PHP,
             }
 
             $phpDocInfo = $this->phpDocInfoFactory->createFromNodeOrEmpty($method);
+            $methodChanged = false;
             foreach ($missingThrows as $missingThrow) {
+                if (!$this->shouldAnnotateException($missingThrow, $scope)) {
+                    continue;
+                }
+
                 $phpDocInfo->addPhpDocTagNode(new PhpDocTagNode(
                     '@throws',
                     new ThrowsTagValueNode(
@@ -200,6 +251,11 @@ PHP,
                         '',
                     ),
                 ));
+                $methodChanged = true;
+            }
+
+            if (!$methodChanged) {
+                continue;
             }
 
             $this->docBlockUpdater->updateRefactoredNodeWithPhpDocInfo($method);
@@ -579,5 +635,53 @@ PHP,
         }
 
         return false;
+    }
+
+    private function shouldAnnotateException(string $exceptionClass, ?Scope $scope): bool
+    {
+        if ($this->isExcludedException($exceptionClass)) {
+            return false;
+        }
+
+        if ($this->includeUnchecked || !$scope instanceof Scope) {
+            return true;
+        }
+
+        return $this->getExceptionTypeResolver()->isCheckedException($exceptionClass, $scope);
+    }
+
+    private function isExcludedException(string $exceptionClass): bool
+    {
+        foreach ($this->excludedExceptionClasses as $excludedExceptionClass) {
+            if (strcasecmp($exceptionClass, $excludedExceptionClass) === 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function getExceptionTypeResolver(): DefaultExceptionTypeResolver
+    {
+        if ($this->exceptionTypeResolver instanceof DefaultExceptionTypeResolver) {
+            return $this->exceptionTypeResolver;
+        }
+
+        $phpstanConfigPaths = SimpleParameterProvider::hasParameter(Option::PHPSTAN_FOR_RECTOR_PATHS)
+            ? SimpleParameterProvider::provideArrayParameter(Option::PHPSTAN_FOR_RECTOR_PATHS)
+            : [];
+        $tempDirectory = sys_get_temp_dir() . '/annotate-throws-rector-phpstan';
+        if (!is_dir($tempDirectory)) {
+            mkdir($tempDirectory, 0777, true);
+        }
+
+        $containerFactory = new ContainerFactory(getcwd());
+        $container = $containerFactory->create(
+            tempDirectory: $tempDirectory,
+            additionalConfigFiles: $phpstanConfigPaths,
+            analysedPaths: [],
+        );
+
+        return $this->exceptionTypeResolver = $container->getByType(DefaultExceptionTypeResolver::class);
     }
 }

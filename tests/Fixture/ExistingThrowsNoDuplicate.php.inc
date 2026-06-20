@@ -30,9 +30,6 @@ final class ExistingThrowsNoDuplicate
         $this->normalize();
     }
 
-    /**
-     * @throws \RuntimeException
-     */
     private function normalize(): void
     {
         throw new RuntimeException('boom');

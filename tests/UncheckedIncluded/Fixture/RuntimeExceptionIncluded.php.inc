@@ -1,6 +1,6 @@
 <?php
 
-final class DirectThrowMethod
+final class RuntimeExceptionIncluded
 {
     public function run(): void
     {
@@ -12,8 +12,11 @@ final class DirectThrowMethod
 -----
 <?php
 
-final class DirectThrowMethod
+final class RuntimeExceptionIncluded
 {
+    /**
+     * @throws \RuntimeException
+     */
     public function run(): void
     {
         throw new RuntimeException('boom');

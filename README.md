@@ -12,6 +12,7 @@ Current MVP scope:
 - inter-class propagation relies on existing callee docblocks
 - repeated Rector runs can gradually converge the call graph across files
 - caught exceptions inside `try/catch` are not propagated
+- unchecked/wide exceptions are skipped by default
 - existing `@throws` tags are preserved and deduplicated
 - no removal of stale `@throws` tags yet
 
@@ -32,10 +33,37 @@ use Rector\Config\RectorConfig;
 use SavinMikhail\AnnotateThrowsRector\AnnotateThrowsRector;
 
 return RectorConfig::configure()
+    ->phpstanConfig(__DIR__ . '/phpstan.neon')
     ->withRules([
         AnnotateThrowsRector::class,
     ]);
 ```
+
+If you want to include unchecked exceptions too:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use Rector\Config\RectorConfig;
+use SavinMikhail\AnnotateThrowsRector\AnnotateThrowsRector;
+
+return RectorConfig::configure()
+    ->phpstanConfig(__DIR__ . '/phpstan.neon')
+    ->withConfiguredRule(AnnotateThrowsRector::class, [
+        AnnotateThrowsRector::INCLUDE_UNCHECKED => true,
+        AnnotateThrowsRector::EXCLUDED_EXCEPTION_CLASSES => [
+            \Throwable::class,
+            \Exception::class,
+            \Error::class,
+            \RuntimeException::class,
+            \LogicException::class,
+        ],
+    ]);
+```
+
+When `phpstanConfig()` is provided, the rule reuses PHPStan checked/unchecked exception policy. The local `EXCLUDED_EXCEPTION_CLASSES` list is applied on top.
 
 ## Example
 
@@ -49,7 +77,7 @@ final class InterviewRunner
 
     public function normalize(): void
     {
-        throw new \RuntimeException('Boom');
+        throw new \JsonException('Boom');
     }
 }
 ```
@@ -60,7 +88,7 @@ becomes
 final class InterviewRunner
 {
     /**
-     * @throws \RuntimeException
+     * @throws \JsonException
      */
     public function process(): void
     {
@@ -68,11 +96,11 @@ final class InterviewRunner
     }
 
     /**
-     * @throws \RuntimeException
+     * @throws \JsonException
      */
     public function normalize(): void
     {
-        throw new \RuntimeException('Boom');
+        throw new \JsonException('Boom');
     }
 }
 ```

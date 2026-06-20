@@ -30,9 +30,6 @@ final class TryCatchStopsPropagation
         }
     }
 
-    /**
-     * @throws \RuntimeException
-     */
     private function normalize(): void
     {
         throw new RuntimeException('boom');

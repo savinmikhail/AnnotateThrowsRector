@@ -19,17 +19,11 @@ final class SameClassPropagation
 
 final class SameClassPropagation
 {
-    /**
-     * @throws \RuntimeException
-     */
     public function process(): void
     {
         $this->normalize();
     }
 
-    /**
-     * @throws \RuntimeException
-     */
     private function normalize(): void
     {
         throw new RuntimeException('boom');
