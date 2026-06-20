@@ -1,0 +1,81 @@
+version: '3'
+tasks:
+  test:
+    cmd: 'docker compose exec rector-php sh -c "vendor/bin/phpunit --coverage-html var/coverage"'
+
+  cs-fix:
+    deps: [install]
+    cmd: 'docker compose exec rector-php sh -c "vendor/bin/php-cs-fixer fix --diff --verbose {{.CLI_ARGS}}"'
+
+  cs:
+    deps: [install]
+    cmds:
+      - task: cs-fix
+        vars:
+          CLI_ARGS: "--dry-run --stop-on-violation {{.CLI_ARGS}}"
+
+  rector-fix:
+    deps: [install]
+    cmd: 'vendor/bin/rector process {{.CLI_ARGS}}'
+
+  rector:
+    cmds:
+      - task: rector-fix
+        vars:
+          CLI_ARGS: "--dry-run {{.CLI_ARGS}}"
+
+  stan:
+    deps: [install]
+    cmd: 'docker compose exec rector-php sh -c "vendor/bin/phpstan {{.CLI_ARGS}}"'
+
+  install:
+    deps: [up]
+    cmd: 'docker compose exec rector-php sh -c "composer install"'
+    sources:
+      - composer.json
+      - composer.lock
+    generates:
+      - vendor/autoload.php
+
+  composer-normalize-fix:
+    deps: [install]
+    cmds:
+      - 'composer normalize --diff {{.CLI_ARGS}}'
+
+  composer-normalize:
+    cmds:
+      - task: composer-normalize-fix
+        vars:
+          CLI_ARGS: '--dry-run {{.CLI_ARGS}}'
+
+  composer-validate: 'composer validate --strict --no-check-publish {{.CLI_ARGS}}'
+
+  composer-audit: 'composer audit {{.CLI_ARGS}}'
+
+  composer-check-require:
+    deps: [install]
+    cmd: 'vendor/bin/composer-require-checker check {{.CLI_ARGS}}'
+
+  composer-check-unused:
+    deps: [install]
+    cmd: 'vendor/bin/composer-unused {{.CLI_ARGS}}'
+
+  dist-size-optimize:
+    deps: [ install ]
+    cmd: 'vendor/bin/dist-size-optimizer check {{.CLI_ARGS}}'
+
+  up:
+    cmd: 'docker compose up -d'
+
+  quality:
+    cmds:
+      - task: cs-fix
+#      - task: stan
+      - task: rector-fix
+      - task: test
+      - task: composer-validate
+      - task: composer-audit
+      - task: composer-normalize-fix
+#      - task: composer-check-require
+#      - task: composer-check-unused
+      - task: dist-size-optimize

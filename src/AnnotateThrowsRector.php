@@ -1,0 +1,481 @@
+<?php
+
+declare(strict_types=1);
+
+namespace SavinMikhail\AnnotateThrowsRector;
+
+use PHPStan\PhpDocParser\Ast\PhpDoc\PhpDocTagNode;
+use PHPStan\PhpDocParser\Ast\PhpDoc\ThrowsTagValueNode;
+use PHPStan\Type\Type;
+use PhpParser\Node;
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Expr\Throw_;
+use PhpParser\Node\Name;
+use PhpParser\Node\Stmt\Catch_;
+use PhpParser\Node\Stmt\ClassLike;
+use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\TryCatch;
+use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfo;
+use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfoFactory;
+use Rector\BetterPhpDocParser\ValueObject\Type\FullyQualifiedIdentifierTypeNode;
+use Rector\Comments\NodeDocBlock\DocBlockUpdater;
+use Rector\Rector\AbstractRector;
+use SavinMikhail\AnnotateThrowsRector\ValueObject\MethodAnalysis;
+use SavinMikhail\AnnotateThrowsRector\ValueObject\MethodCallEdge;
+use Symplify\RuleDocGenerator\ValueObject\CodeSample\CodeSample;
+use Symplify\RuleDocGenerator\ValueObject\RuleDefinition;
+
+use function array_diff;
+use function array_key_exists;
+use function array_unique;
+use function class_exists;
+use function interface_exists;
+use function is_a;
+use function is_array;
+use function is_string;
+use function ltrim;
+use function preg_match_all;
+use function sort;
+use function strcasecmp;
+
+final class AnnotateThrowsRector extends AbstractRector
+{
+    /**
+     * @var string[]
+     */
+    private const SCALAR_PHPDOC_TYPES = [
+        'array',
+        'bool',
+        'callable',
+        'false',
+        'float',
+        'int',
+        'iterable',
+        'mixed',
+        'never',
+        'null',
+        'object',
+        'parent',
+        'self',
+        'static',
+        'string',
+        'true',
+        'void',
+    ];
+
+    public function __construct(
+        private readonly PhpDocInfoFactory $phpDocInfoFactory,
+        private readonly DocBlockUpdater $docBlockUpdater,
+    ) {
+    }
+
+    public function getRuleDefinition(): RuleDefinition
+    {
+        return new RuleDefinition(
+            'Add missing @throws tags for direct throws and same-class propagation',
+            [
+                new CodeSample(
+                    <<<'PHP'
+final class Example
+{
+    public function run(): void
+    {
+        $this->fail();
+    }
+
+    private function fail(): void
+    {
+        throw new \RuntimeException();
+    }
+}
+PHP,
+                    <<<'PHP'
+final class Example
+{
+    /**
+     * @throws \RuntimeException
+     */
+    public function run(): void
+    {
+        $this->fail();
+    }
+
+    /**
+     * @throws \RuntimeException
+     */
+    private function fail(): void
+    {
+        throw new \RuntimeException();
+    }
+}
+PHP,
+                ),
+            ],
+        );
+    }
+
+    public function getNodeTypes(): array
+    {
+        return [ClassLike::class];
+    }
+
+    public function refactor(Node $node): ?Node
+    {
+        if (!$node instanceof ClassLike) {
+            return null;
+        }
+
+        $methods = $this->collectMethods($node);
+        if ($methods === []) {
+            return null;
+        }
+
+        $analyses = [];
+        foreach ($methods as $methodName => $method) {
+            $analyses[$methodName] = $this->analyzeMethod($method);
+        }
+
+        $resolvedThrows = [];
+        foreach ($analyses as $methodName => $analysis) {
+            $resolvedThrows[$methodName] = $this->normalizeTypes([
+                ...$analysis->existingThrows,
+                ...$analysis->directThrows,
+            ]);
+        }
+
+        $hasChanged = true;
+        while ($hasChanged) {
+            $hasChanged = false;
+
+            foreach ($analyses as $methodName => $analysis) {
+                $nextThrows = $resolvedThrows[$methodName];
+
+                foreach ($analysis->methodCallEdges as $methodCallEdge) {
+                    if (!array_key_exists($methodCallEdge->callee, $resolvedThrows)) {
+                        continue;
+                    }
+
+                    foreach ($resolvedThrows[$methodCallEdge->callee] as $calleeThrowType) {
+                        if ($this->isCaughtByAny($calleeThrowType, $methodCallEdge->caughtTypes)) {
+                            continue;
+                        }
+
+                        $nextThrows[] = $calleeThrowType;
+                    }
+                }
+
+                $nextThrows = $this->normalizeTypes($nextThrows);
+                if ($nextThrows === $resolvedThrows[$methodName]) {
+                    continue;
+                }
+
+                $resolvedThrows[$methodName] = $nextThrows;
+                $hasChanged = true;
+            }
+        }
+
+        $classChanged = false;
+        foreach ($methods as $methodName => $method) {
+            $missingThrows = array_diff($resolvedThrows[$methodName], $analyses[$methodName]->existingThrows);
+            if ($missingThrows === []) {
+                continue;
+            }
+
+            $phpDocInfo = $this->phpDocInfoFactory->createFromNodeOrEmpty($method);
+            foreach ($missingThrows as $missingThrow) {
+                $phpDocInfo->addPhpDocTagNode(new PhpDocTagNode(
+                    '@throws',
+                    new ThrowsTagValueNode(
+                        new FullyQualifiedIdentifierTypeNode($missingThrow),
+                        '',
+                    ),
+                ));
+            }
+
+            $this->docBlockUpdater->updateRefactoredNodeWithPhpDocInfo($method);
+            $classChanged = true;
+        }
+
+        return $classChanged ? $node : null;
+    }
+
+    /**
+     * @return array<string, ClassMethod>
+     */
+    private function collectMethods(ClassLike $classLike): array
+    {
+        $methods = [];
+        foreach ($classLike->getMethods() as $method) {
+            if ($method->stmts === null) {
+                continue;
+            }
+
+            $methodName = $this->getName($method);
+            $methods[$methodName] = $method;
+        }
+
+        return $methods;
+    }
+
+    private function analyzeMethod(ClassMethod $classMethod): MethodAnalysis
+    {
+        $existingThrows = $this->extractThrowsFromPhpDocInfo($this->phpDocInfoFactory->createFromNode($classMethod));
+        $directThrows = [];
+        $methodCallEdges = [];
+
+        $this->collectThrowsAndCalls(
+            nodes: $classMethod->stmts ?? [],
+            directThrows: $directThrows,
+            methodCallEdges: $methodCallEdges,
+            caughtTypes: [],
+        );
+
+        return new MethodAnalysis(
+            existingThrows: $existingThrows,
+            directThrows: $this->normalizeTypes($directThrows),
+            methodCallEdges: $methodCallEdges,
+        );
+    }
+
+    /**
+     * @param Node[] $nodes
+     * @param string[] $directThrows
+     * @param MethodCallEdge[] $methodCallEdges
+     * @param string[] $caughtTypes
+     */
+    private function collectThrowsAndCalls(
+        array $nodes,
+        array &$directThrows,
+        array &$methodCallEdges,
+        array $caughtTypes,
+    ): void {
+        foreach ($nodes as $node) {
+            if ($node instanceof TryCatch) {
+                $tryCaughtTypes = $caughtTypes;
+                foreach ($node->catches as $catch) {
+                    $tryCaughtTypes = [...$tryCaughtTypes, ...$this->resolveCatchTypes($catch)];
+                }
+
+                $this->collectThrowsAndCalls($node->stmts, $directThrows, $methodCallEdges, $tryCaughtTypes);
+
+                foreach ($node->catches as $catch) {
+                    $this->collectThrowsAndCalls($catch->stmts, $directThrows, $methodCallEdges, $caughtTypes);
+                }
+
+                $this->collectThrowsAndCalls($node->finally->stmts ?? [], $directThrows, $methodCallEdges, $caughtTypes);
+                continue;
+            }
+
+            if ($node instanceof ClassMethod) {
+                continue;
+            }
+
+            if ($node instanceof Throw_) {
+                foreach ($this->resolveThrownTypeNames($node->expr) as $throwType) {
+                    if ($this->isCaughtByAny($throwType, $caughtTypes)) {
+                        continue;
+                    }
+
+                    $directThrows[] = $throwType;
+                }
+            }
+
+            $calleeName = $this->resolveSameClassCalleeName($node);
+            if ($calleeName !== null) {
+                $methodCallEdges[] = new MethodCallEdge(
+                    callee: $calleeName,
+                    caughtTypes: $this->normalizeTypes($caughtTypes),
+                );
+            }
+
+            foreach ($node->getSubNodeNames() as $subNodeName) {
+                $subNode = $node->{$subNodeName};
+                if ($subNode instanceof Node) {
+                    $this->collectThrowsAndCalls([$subNode], $directThrows, $methodCallEdges, $caughtTypes);
+                    continue;
+                }
+
+                if (!is_array($subNode)) {
+                    continue;
+                }
+
+                $subNodes = [];
+                foreach ($subNode as $item) {
+                    if ($item instanceof Node) {
+                        $subNodes[] = $item;
+                    }
+                }
+
+                if ($subNodes !== []) {
+                    $this->collectThrowsAndCalls($subNodes, $directThrows, $methodCallEdges, $caughtTypes);
+                }
+            }
+        }
+    }
+
+    /**
+     * @return string[]
+     */
+    private function extractThrowsFromPhpDocInfo(?PhpDocInfo $phpDocInfo): array
+    {
+        if (!$phpDocInfo instanceof PhpDocInfo) {
+            return [];
+        }
+
+        $throws = [];
+        foreach ($phpDocInfo->getTagsByName('throws') as $tagNode) {
+            if (!$tagNode->value instanceof ThrowsTagValueNode) {
+                continue;
+            }
+
+            $throws = [...$throws, ...$this->extractTypeNamesFromString((string) $tagNode->value->type)];
+        }
+
+        return $this->normalizeTypes($throws);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function resolveThrownTypeNames(Node $expr): array
+    {
+        return $this->normalizeTypes($this->resolveTypeClassNames($this->getType($expr)));
+    }
+
+    /**
+     * @return string[]
+     */
+    private function resolveTypeClassNames(Type $type): array
+    {
+        return $type->getObjectClassNames();
+    }
+
+    private function resolveSameClassCalleeName(Node $node): ?string
+    {
+        if ($node instanceof MethodCall) {
+            if (!$this->isName($node->var, 'this')) {
+                return null;
+            }
+
+            return $this->getName($node->name);
+        }
+
+        if (!$node instanceof StaticCall) {
+            return null;
+        }
+
+        if (!$node->class instanceof Name) {
+            return null;
+        }
+
+        if (!$this->isNames($node->class, ['self', 'static'])) {
+            return null;
+        }
+
+        return $this->getName($node->name);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function resolveCatchTypes(Catch_ $catch): array
+    {
+        $caughtTypes = [];
+        foreach ($catch->types as $type) {
+            $caughtTypes[] = $type->toString();
+        }
+
+        return $this->normalizeTypes($caughtTypes);
+    }
+
+    /**
+     * @param string[] $types
+     * @return string[]
+     */
+    private function normalizeTypes(array $types): array
+    {
+        $normalizedTypes = [];
+        foreach ($types as $type) {
+            $normalizedType = ltrim($type, '\\');
+            if ($normalizedType === '' || $this->isScalarPhpDocType($normalizedType)) {
+                continue;
+            }
+
+            $normalizedTypes[] = $normalizedType;
+        }
+
+        $normalizedTypes = array_values(array_unique($normalizedTypes));
+        sort($normalizedTypes);
+
+        return $normalizedTypes;
+    }
+
+    /**
+     * @return string[]
+     */
+    private function extractTypeNamesFromString(string $type): array
+    {
+        preg_match_all('~\\\\?[A-Za-z_][A-Za-z0-9_\\\\]*~', $type, $matches);
+
+        $types = [];
+        foreach ($matches[0] as $match) {
+            if ($this->isScalarPhpDocType($match)) {
+                continue;
+            }
+
+            $types[] = $match;
+        }
+
+        return $this->normalizeTypes($types);
+    }
+
+    /**
+     * @param string[] $caughtTypes
+     */
+    private function isCaughtByAny(string $throwType, array $caughtTypes): bool
+    {
+        foreach ($caughtTypes as $caughtType) {
+            if ($this->isCaughtBy($throwType, $caughtType)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isCaughtBy(string $throwType, string $caughtType): bool
+    {
+        $normalizedThrowType = ltrim($throwType, '\\');
+        $normalizedCaughtType = ltrim($caughtType, '\\');
+
+        if (strcasecmp($normalizedCaughtType, 'Throwable') === 0) {
+            return true;
+        }
+
+        if (strcasecmp($normalizedThrowType, $normalizedCaughtType) === 0) {
+            return true;
+        }
+
+        if (!(class_exists($normalizedThrowType) || interface_exists($normalizedThrowType))) {
+            return false;
+        }
+
+        if (!(class_exists($normalizedCaughtType) || interface_exists($normalizedCaughtType))) {
+            return false;
+        }
+
+        return is_a($normalizedThrowType, $normalizedCaughtType, true);
+    }
+
+    private function isScalarPhpDocType(string $type): bool
+    {
+        foreach (self::SCALAR_PHPDOC_TYPES as $scalarPhpDocType) {
+            if (strcasecmp($type, $scalarPhpDocType) === 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}

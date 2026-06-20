@@ -1,0 +1,8 @@
+parameters:
+	paths:
+		- src
+	excludePaths:
+		- tests/Fixture/*
+	level: 6
+	parallel:
+		maximumNumberOfProcesses: 1
