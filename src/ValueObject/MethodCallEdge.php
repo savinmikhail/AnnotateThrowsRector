@@ -10,7 +10,8 @@ final readonly class MethodCallEdge
      * @param string[] $caughtTypes
      */
     public function __construct(
-        public string $callee,
+        public ?string $className,
+        public string $methodName,
         public array $caughtTypes,
     ) {
     }

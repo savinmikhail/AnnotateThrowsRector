@@ -20,14 +20,17 @@ use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfo;
 use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfoFactory;
 use Rector\BetterPhpDocParser\ValueObject\Type\FullyQualifiedIdentifierTypeNode;
 use Rector\Comments\NodeDocBlock\DocBlockUpdater;
+use Rector\NodeTypeResolver\Node\AttributeKey;
 use Rector\Rector\AbstractRector;
 use SavinMikhail\AnnotateThrowsRector\ValueObject\MethodAnalysis;
 use SavinMikhail\AnnotateThrowsRector\ValueObject\MethodCallEdge;
 use Symplify\RuleDocGenerator\ValueObject\CodeSample\CodeSample;
 use Symplify\RuleDocGenerator\ValueObject\RuleDefinition;
+use PHPStan\Reflection\ReflectionProvider;
 
 use function array_diff;
 use function array_key_exists;
+use function array_map;
 use function array_unique;
 use function class_exists;
 use function interface_exists;
@@ -35,9 +38,11 @@ use function is_a;
 use function is_array;
 use function is_string;
 use function ltrim;
+use function preg_match;
 use function preg_match_all;
 use function sort;
 use function strcasecmp;
+use function sprintf;
 
 final class AnnotateThrowsRector extends AbstractRector
 {
@@ -64,9 +69,15 @@ final class AnnotateThrowsRector extends AbstractRector
         'void',
     ];
 
+    /**
+     * @var array<string, string[]>
+     */
+    private array $externalThrowsCache = [];
+
     public function __construct(
         private readonly PhpDocInfoFactory $phpDocInfoFactory,
         private readonly DocBlockUpdater $docBlockUpdater,
+        private readonly ReflectionProvider $reflectionProvider,
     ) {
     }
 
@@ -131,9 +142,10 @@ PHP,
             return null;
         }
 
+        $currentClassName = $this->resolveCurrentClassName($node);
         $analyses = [];
         foreach ($methods as $methodName => $method) {
-            $analyses[$methodName] = $this->analyzeMethod($method);
+            $analyses[$methodName] = $this->analyzeMethod($method, $currentClassName);
         }
 
         $resolvedThrows = [];
@@ -152,11 +164,7 @@ PHP,
                 $nextThrows = $resolvedThrows[$methodName];
 
                 foreach ($analysis->methodCallEdges as $methodCallEdge) {
-                    if (!array_key_exists($methodCallEdge->callee, $resolvedThrows)) {
-                        continue;
-                    }
-
-                    foreach ($resolvedThrows[$methodCallEdge->callee] as $calleeThrowType) {
+                    foreach ($this->resolveEdgeThrows($methodCallEdge, $currentClassName, $resolvedThrows) as $calleeThrowType) {
                         if ($this->isCaughtByAny($calleeThrowType, $methodCallEdge->caughtTypes)) {
                             continue;
                         }
@@ -218,7 +226,7 @@ PHP,
         return $methods;
     }
 
-    private function analyzeMethod(ClassMethod $classMethod): MethodAnalysis
+    private function analyzeMethod(ClassMethod $classMethod, ?string $currentClassName): MethodAnalysis
     {
         $existingThrows = $this->extractThrowsFromPhpDocInfo($this->phpDocInfoFactory->createFromNode($classMethod));
         $directThrows = [];
@@ -229,6 +237,7 @@ PHP,
             directThrows: $directThrows,
             methodCallEdges: $methodCallEdges,
             caughtTypes: [],
+            currentClassName: $currentClassName,
         );
 
         return new MethodAnalysis(
@@ -249,6 +258,7 @@ PHP,
         array &$directThrows,
         array &$methodCallEdges,
         array $caughtTypes,
+        ?string $currentClassName,
     ): void {
         foreach ($nodes as $node) {
             if ($node instanceof TryCatch) {
@@ -257,13 +267,13 @@ PHP,
                     $tryCaughtTypes = [...$tryCaughtTypes, ...$this->resolveCatchTypes($catch)];
                 }
 
-                $this->collectThrowsAndCalls($node->stmts, $directThrows, $methodCallEdges, $tryCaughtTypes);
+                $this->collectThrowsAndCalls($node->stmts, $directThrows, $methodCallEdges, $tryCaughtTypes, $currentClassName);
 
                 foreach ($node->catches as $catch) {
-                    $this->collectThrowsAndCalls($catch->stmts, $directThrows, $methodCallEdges, $caughtTypes);
+                    $this->collectThrowsAndCalls($catch->stmts, $directThrows, $methodCallEdges, $caughtTypes, $currentClassName);
                 }
 
-                $this->collectThrowsAndCalls($node->finally->stmts ?? [], $directThrows, $methodCallEdges, $caughtTypes);
+                $this->collectThrowsAndCalls($node->finally->stmts ?? [], $directThrows, $methodCallEdges, $caughtTypes, $currentClassName);
                 continue;
             }
 
@@ -281,18 +291,14 @@ PHP,
                 }
             }
 
-            $calleeName = $this->resolveSameClassCalleeName($node);
-            if ($calleeName !== null) {
-                $methodCallEdges[] = new MethodCallEdge(
-                    callee: $calleeName,
-                    caughtTypes: $this->normalizeTypes($caughtTypes),
-                );
+            foreach ($this->resolveCallEdges($node, $currentClassName, $caughtTypes) as $methodCallEdge) {
+                $methodCallEdges[] = $methodCallEdge;
             }
 
             foreach ($node->getSubNodeNames() as $subNodeName) {
                 $subNode = $node->{$subNodeName};
                 if ($subNode instanceof Node) {
-                    $this->collectThrowsAndCalls([$subNode], $directThrows, $methodCallEdges, $caughtTypes);
+                    $this->collectThrowsAndCalls([$subNode], $directThrows, $methodCallEdges, $caughtTypes, $currentClassName);
                     continue;
                 }
 
@@ -308,7 +314,7 @@ PHP,
                 }
 
                 if ($subNodes !== []) {
-                    $this->collectThrowsAndCalls($subNodes, $directThrows, $methodCallEdges, $caughtTypes);
+                    $this->collectThrowsAndCalls($subNodes, $directThrows, $methodCallEdges, $caughtTypes, $currentClassName);
                 }
             }
         }
@@ -351,29 +357,125 @@ PHP,
         return $type->getObjectClassNames();
     }
 
-    private function resolveSameClassCalleeName(Node $node): ?string
+    /**
+     * @param string[] $caughtTypes
+     * @return MethodCallEdge[]
+     */
+    private function resolveCallEdges(Node $node, ?string $currentClassName, array $caughtTypes): array
     {
         if ($node instanceof MethodCall) {
-            if (!$this->isName($node->var, 'this')) {
-                return null;
+            $methodName = $this->getName($node->name);
+            if (!is_string($methodName)) {
+                return [];
             }
 
-            return $this->getName($node->name);
+            $classNames = $this->isName($node->var, 'this')
+                ? [$currentClassName]
+                : $this->normalizeTypes($this->getType($node->var)->getObjectClassNames());
+
+            return $this->createEdgesForClassNames($classNames, $methodName, $caughtTypes);
         }
 
         if (!$node instanceof StaticCall) {
-            return null;
+            return [];
+        }
+
+        $methodName = $this->getName($node->name);
+        if (!is_string($methodName)) {
+            return [];
+        }
+
+        if ($node->class instanceof Name && $this->isNames($node->class, ['self', 'static'])) {
+            return $this->createEdgesForClassNames([$currentClassName], $methodName, $caughtTypes);
         }
 
         if (!$node->class instanceof Name) {
-            return null;
+            return [];
         }
 
-        if (!$this->isNames($node->class, ['self', 'static'])) {
-            return null;
+        $className = $this->getName($node->class);
+
+        return $this->createEdgesForClassNames([$className], $methodName, $caughtTypes);
+    }
+
+    /**
+     * @param array<string, string[]> $resolvedThrows
+     * @return string[]
+     */
+    private function resolveEdgeThrows(MethodCallEdge $methodCallEdge, ?string $currentClassName, array $resolvedThrows): array
+    {
+        if ($methodCallEdge->className === null || $methodCallEdge->className === $currentClassName) {
+            return $resolvedThrows[$methodCallEdge->methodName] ?? [];
         }
 
-        return $this->getName($node->name);
+        return $this->resolveExternalMethodThrows($methodCallEdge->className, $methodCallEdge->methodName);
+    }
+
+    /**
+     * @param string[] $classNames
+     * @param string[] $caughtTypes
+     * @return MethodCallEdge[]
+     */
+    private function createEdgesForClassNames(array $classNames, string $methodName, array $caughtTypes): array
+    {
+        $normalizedCaughtTypes = $this->normalizeTypes($caughtTypes);
+
+        return array_map(
+            static fn (string $className): MethodCallEdge => new MethodCallEdge(
+                className: $className,
+                methodName: $methodName,
+                caughtTypes: $normalizedCaughtTypes,
+            ),
+            array_values(array_filter($classNames, static fn (?string $className): bool => is_string($className) && $className !== '')),
+        );
+    }
+
+    /**
+     * @return string[]
+     */
+    private function resolveExternalMethodThrows(string $className, string $methodName): array
+    {
+        $cacheKey = sprintf('%s::%s', $className, $methodName);
+        if (array_key_exists($cacheKey, $this->externalThrowsCache)) {
+            return $this->externalThrowsCache[$cacheKey];
+        }
+
+        if (!$this->reflectionProvider->hasClass($className)) {
+            return $this->externalThrowsCache[$cacheKey] = [];
+        }
+
+        $nativeReflection = $this->reflectionProvider->getClass($className)->getNativeReflection();
+        if (!$nativeReflection->hasMethod($methodName)) {
+            return $this->externalThrowsCache[$cacheKey] = [];
+        }
+
+        $docComment = $nativeReflection->getMethod($methodName)->getDocComment();
+        if ($docComment === false) {
+            return $this->externalThrowsCache[$cacheKey] = [];
+        }
+
+        preg_match_all('~@throws\s+([^\r\n*]+)~', $docComment, $matches);
+
+        $throws = [];
+        foreach ($matches[1] as $throwSignature) {
+            $throws = [...$throws, ...$this->extractTypeNamesFromString($throwSignature)];
+        }
+
+        return $this->externalThrowsCache[$cacheKey] = $this->normalizeTypes($throws);
+    }
+
+    private function resolveCurrentClassName(ClassLike $classLike): ?string
+    {
+        $namespacedName = $classLike->getAttribute(AttributeKey::NAMESPACED_NAME);
+        if ($namespacedName instanceof Name) {
+            return $namespacedName->toString();
+        }
+
+        if ($classLike->name instanceof Node\Identifier) {
+            return $classLike->name->toString();
+        }
+
+        return null;
     }
 
     /**

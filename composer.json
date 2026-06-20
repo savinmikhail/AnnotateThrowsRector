@@ -1,6 +1,6 @@
 {
     "name": "savinmikhail/annotate_throws_rector",
-    "description": "Rector rule to add missing @throws tags for direct throws and same-class propagation",
+    "description": "Rector rule to add missing @throws tags for direct throws and inter-class propagation",
     "license": "MIT",
     "type": "rector-extension",
     "keywords": [
@@ -28,8 +28,7 @@
         "maglnet/composer-require-checker": "^4.15",
         "phpunit/phpunit": "^10.5.45",
         "phpyh/coding-standard": "^2.6.2",
-        "savinmikhail/add_named_arguments_rector": "^0.1.18",
-        "savinmikhail/dist-size-optimizer": "^0.2.0"
+        "savinmikhail/dist-size-optimizer": "^0.2.7"
     },
     "prefer-stable": true,
     "autoload": {

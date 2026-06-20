@@ -4,12 +4,13 @@ Rector extension that adds missing `@throws` tags for:
 
 - direct `throw` expressions in class methods
 - propagation through same-class calls like `$this->foo()`, `self::foo()`, `static::foo()`
-- methods that call other same-class methods already documented with `@throws`
+- propagation through inter-class calls when the callee already has `@throws`
 
 Current MVP scope:
 
 - class methods only
-- same-class propagation only
+- inter-class propagation relies on existing callee docblocks
+- repeated Rector runs can gradually converge the call graph across files
 - caught exceptions inside `try/catch` are not propagated
 - existing `@throws` tags are preserved and deduplicated
 - no removal of stale `@throws` tags yet
