@@ -353,8 +353,12 @@ PHP,
     /**
      * @return string[]
      */
-    private function resolveTypeClassNames(Type $type): array
+    private function resolveTypeClassNames(?Type $type): array
     {
+        if (!$type instanceof Type) {
+            return [];
+        }
+
         return $type->getObjectClassNames();
     }
 
