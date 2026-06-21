@@ -519,7 +519,7 @@ PHP,
         $throws = $this->resolveTypeClassNames($methodReflection->getThrowType());
 
         $docComment = $methodReflection->getDocComment();
-        if (is_string($docComment) && $docComment !== '') {
+        if ($throws === [] && is_string($docComment) && $docComment !== '') {
             $throws = [
                 ...$throws,
                 ...$this->extractThrowsFromDocComment($docComment),
