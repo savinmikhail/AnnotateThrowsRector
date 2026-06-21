@@ -10,6 +10,7 @@ use PHPStan\PhpDocParser\Ast\PhpDoc\PhpDocTagNode;
 use PHPStan\PhpDocParser\Ast\PhpDoc\ThrowsTagValueNode;
 use PHPStan\Rules\Exceptions\DefaultExceptionTypeResolver;
 use PHPStan\Type\Type;
+use PhpParser\Comment\Doc;
 use PhpParser\Node;
 use PhpParser\Node\Expr\MethodCall;
 use PhpParser\Node\Expr\StaticCall;
@@ -18,6 +19,7 @@ use PhpParser\Node\Name;
 use PhpParser\Node\Stmt\Catch_;
 use PhpParser\Node\Stmt\ClassLike;
 use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\Nop;
 use PhpParser\Node\Stmt\TryCatch;
 use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfo;
 use Rector\BetterPhpDocParser\PhpDocInfo\PhpDocInfoFactory;
@@ -48,7 +50,6 @@ use function is_dir;
 use function is_string;
 use function ltrim;
 use function mkdir;
-use function preg_match_all;
 use function sort;
 use function strcasecmp;
 use function sprintf;
@@ -519,13 +520,25 @@ PHP,
 
         $docComment = $methodReflection->getDocComment();
         if (is_string($docComment) && $docComment !== '') {
-            preg_match_all('~@throws\s+([^\r\n*]+)~', $docComment, $matches);
-            foreach ($matches[1] as $throwSignature) {
-                $throws = [...$throws, ...$this->extractTypeNamesFromString($throwSignature)];
-            }
+            $throws = [
+                ...$throws,
+                ...$this->extractThrowsFromDocComment($docComment),
+            ];
         }
 
         return $this->externalThrowsCache[$cacheKey] = $this->normalizeTypes($throws);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function extractThrowsFromDocComment(string $docComment): array
+    {
+        $virtualNode = new Nop([
+            'comments' => [new Doc($docComment)],
+        ]);
+
+        return $this->extractThrowsFromPhpDocInfo($this->phpDocInfoFactory->createFromNode($virtualNode));
     }
 
     private function resolveCurrentClassName(ClassLike $classLike): ?string
